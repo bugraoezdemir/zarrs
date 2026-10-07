@@ -60,6 +60,18 @@ _coverage_report:
 _coverage_file:
     cargo +{{TOOLCHAIN}} llvm-cov --all-features --doctests --lcov --output-path lcov.info
 
+# Test data compatibility with the latest zarrs release (as in CI)
+regression *args:
+    cargo +{{TOOLCHAIN}} run -p zarrs_regression_testing -- {{args}}
+
+# Determine how far back data compatibility extends across all tested zarrs releases
+regression_all *args:
+    cargo +{{TOOLCHAIN}} run -p zarrs_regression_testing -- --all {{args}}
+
+# Remove regression testing helpers and work directories
+regression_clean:
+    rm -rf target/zarrs_regression_testing
+
 # Initialize snapshot test data submodule
 init_snapshots:
     git submodule update --init zarrs/tests/data/snapshots
