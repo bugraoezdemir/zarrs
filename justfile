@@ -72,24 +72,3 @@ regression_all *args:
 regression_clean:
     rm -rf target/zarrs_regression_testing
 
-# Initialize snapshot test data submodule
-init_snapshots:
-    git submodule update --init zarrs/tests/data/snapshots
-
-# Test codec snapshots
-test_snapshots:
-    cargo +{{TOOLCHAIN}} test --all-features -p zarrs --test codec_snapshot_tests
-
-# Clean up generated snapshot files
-clean_snapshots:
-    rm -rf zarrs/tests/data/snapshots/*
-
-# Update codec snapshots (requires submodule to be initialized)
-update_snapshots: clean_snapshots
-    UPDATE_SNAPSHOTS=1 cargo +{{TOOLCHAIN}} test --all-features -p zarrs --test codec_snapshot_tests
-    @echo "Snapshot data updated. Check and commit as required."
-
-# Add newly supported codec snapshots (previously unsupported combinations that now work)
-add_snapshots:
-    ADD_SNAPSHOTS=1 cargo +{{TOOLCHAIN}} test --all-features -p zarrs --test codec_snapshot_tests
-    @echo "Newly supported snapshots added. Check and commit as required."
