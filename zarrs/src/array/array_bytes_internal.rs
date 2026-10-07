@@ -4,6 +4,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use itertools::Itertools;
+use unsafe_cell_slice::UnsafeCellSlice;
 
 use super::{ArraySubset, DataType, Indexer};
 use zarrs_codec::{
@@ -91,6 +92,60 @@ pub(crate) fn extract_target_views<'a, 'b>(
             mask_views.insert(0, mask_view);
             (data_view, mask_views)
         }
+    }
+}
+
+/// Merge a set of chunks of any data type (fixed, variable, or optional) into an array subset.
+///
+/// Optional data is merged by independently merging its inner data and its validity mask.
+///
+/// # Errors
+/// Returns a [`CodecError`] if the chunk bytes are incompatible with `data_type` or their subsets are out of bounds.
+///
+/// # Panics
+/// Panics if the `array_shape` exceeds `usize::MAX` elements.
+pub(crate) fn merge_chunks<'a>(
+    chunk_bytes_and_subsets: Vec<(ArrayBytes<'_>, ArraySubset)>,
+    array_shape: &[u64],
+    data_type: &DataType,
+) -> Result<ArrayBytes<'a>, CodecError> {
+    if let Some(inner_data_type) = data_type.optional_inner() {
+        let mut data_and_subsets = Vec::with_capacity(chunk_bytes_and_subsets.len());
+        let mut masks_and_subsets = Vec::with_capacity(chunk_bytes_and_subsets.len());
+        for (chunk_bytes, chunk_subset) in chunk_bytes_and_subsets {
+            let (data, mask) = chunk_bytes.into_optional()?.into_parts();
+            data_and_subsets.push((*data, chunk_subset.clone()));
+            masks_and_subsets.push((ArrayBytes::new_flen(mask), chunk_subset));
+        }
+        let data = merge_chunks(data_and_subsets, array_shape, inner_data_type)?;
+        let mask = merge_chunks(masks_and_subsets, array_shape, &super::data_type::uint8())?;
+        Ok(data.with_optional_mask(mask.into_fixed()?))
+    } else if let Some(data_type_size) = data_type.fixed_size() {
+        let num_elements = usize::try_from(array_shape.iter().product::<u64>()).unwrap();
+        let mut output = vec![0; num_elements * data_type_size];
+        let output_slice = UnsafeCellSlice::new(output.as_mut_slice());
+        for (chunk_bytes, chunk_subset) in chunk_bytes_and_subsets {
+            let mut output_view = unsafe {
+                // SAFETY: chunks represent disjoint array subsets
+                ArrayBytesFixedDisjointView::new(
+                    output_slice,
+                    data_type_size,
+                    array_shape,
+                    chunk_subset,
+                )?
+            };
+            output_view.copy_from_slice(&chunk_bytes.into_fixed()?)?;
+        }
+        Ok(ArrayBytes::new_flen(output))
+    } else {
+        let chunk_bytes_and_subsets = chunk_bytes_and_subsets
+            .into_iter()
+            .map(|(chunk_bytes, chunk_subset)| Ok((chunk_bytes.into_variable()?, chunk_subset)))
+            .collect::<Result<Vec<_>, CodecError>>()?;
+        Ok(ArrayBytes::Variable(merge_chunks_vlen(
+            chunk_bytes_and_subsets,
+            array_shape,
+        )))
     }
 }
 

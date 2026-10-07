@@ -12,7 +12,7 @@ use super::{
     ShardingCodecOptions, ShardingIndexLocation, nested_local_subchunk_grids, subchunk_grid,
 };
 use crate::IntoConcurrentLimitIterator;
-use crate::array::array_bytes_internal::merge_chunks_vlen;
+use crate::array::array_bytes_internal::merge_chunks;
 use crate::array::chunk_grid::RegularBoundedChunkGrid;
 use crate::array::{
     ArrayBytes, ArrayBytesFixedDisjointView, ArrayIndicesTinyVec, ArraySubset, ArraySubsetTraits,
@@ -25,7 +25,6 @@ use zarrs_codec::{
     AsyncByteIntervalPartialDecoder, AsyncBytesPartialDecoderTraits, CodecError, CodecOptions,
     InvalidNumberOfElementsError, decode_into_array_bytes_target,
 };
-use zarrs_plugin::ExtensionAliasesV3;
 use zarrs_storage::StorageError;
 use zarrs_storage::byte_range::{ByteLength, ByteOffset, ByteRange};
 
@@ -118,13 +117,6 @@ pub(crate) async fn partial_decode(
 
     let data_type = inner_codecs.data_type();
     let fill_value = inner_codecs.fill_value();
-    if data_type.is_optional() {
-        return Err(CodecError::UnsupportedDataType(
-            data_type.clone(),
-            super::ShardingCodec::aliases_v3().default_name.to_string(),
-        ));
-    }
-
     let Some(subset) = indexer.as_array_subset() else {
         return partial_decode_indexer(
             input_handle,
@@ -138,8 +130,8 @@ pub(crate) async fn partial_decode(
         .await;
     };
 
-    match data_type.size() {
-        DataTypeSize::Fixed(_data_type_size) => {
+    match (data_type.is_optional(), data_type.size()) {
+        (false, DataTypeSize::Fixed(_data_type_size)) => {
             partial_decode_fixed_array_subset(
                 input_handle,
                 subchunk_grid,
@@ -150,8 +142,8 @@ pub(crate) async fn partial_decode(
             )
             .await
         }
-        DataTypeSize::Variable => {
-            partial_decode_variable_array_subset(
+        (true, _) | (false, DataTypeSize::Variable) => {
+            partial_decode_merged_array_subset(
                 input_handle,
                 data_type,
                 fill_value,
@@ -563,7 +555,10 @@ async fn partial_decode_fixed_array_subset(
 }
 
 #[expect(clippy::too_many_arguments)]
-async fn partial_decode_variable_array_subset(
+/// Partially decode an array subset by decoding the overlapping region of each subchunk and merging them.
+///
+/// This supports any data type, including variable length and optional data types.
+async fn partial_decode_merged_array_subset(
     input_handle: &Arc<dyn AsyncBytesPartialDecoderTraits>,
     data_type: &DataType,
     fill_value: &FillValue,
@@ -608,14 +603,12 @@ async fn partial_decode_variable_array_subset(
                     )
                     .await?
                     .into_owned()
-                    .into_variable()?
             } else {
                 ArrayBytes::new_fill_value(
                     data_type,
                     chunk_subset_overlap.num_elements(),
                     fill_value,
                 )?
-                .into_variable()?
             };
             Ok::<_, CodecError>((
                 chunk_subset_bytes,
@@ -642,8 +635,7 @@ async fn partial_decode_variable_array_subset(
         .await?;
 
     // Convert into an array
-    let out_array_subset = merge_chunks_vlen(chunk_bytes_and_subsets, &array_subset.shape());
-    Ok(ArrayBytes::Variable(out_array_subset))
+    merge_chunks(chunk_bytes_and_subsets, &array_subset.shape(), data_type)
 }
 
 async fn partial_decode_indexer(
