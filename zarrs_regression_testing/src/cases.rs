@@ -3,7 +3,7 @@
 //! Categorical properties (codec kind and mode, data type) are fully swept as *combinations*.
 //! Everything else (codec levels and parameters, shapes, data) is sampled with proptest.
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::Arc;
 
 use proptest::prelude::*;
@@ -35,6 +35,8 @@ pub(crate) enum Values {
     /// Raw bits with this many bytes.
     Raw(usize),
     Complex(Box<Values>),
+    /// UTF-32 code points (any valid character) with this many code points.
+    Utf32(usize),
     String,
     Bytes,
     Optional(Box<Values>),
@@ -50,6 +52,7 @@ impl Values {
             Self::Float32 => Some(4),
             Self::Float64 => Some(8),
             Self::Raw(size) => Some(*size),
+            Self::Utf32(length) => Some(4 * length),
             Self::Complex(values) => values.element_size().map(|size| size * 2),
             Self::String | Self::Bytes => None,
             Self::Optional(values) => values.element_size(),
@@ -75,6 +78,16 @@ impl Values {
                     .prop_map(|value| value.to_ne_bytes().to_vec())
                     .boxed()
             }
+            Self::UInt(bits) if bits % 8 != 0 => {
+                // e.g. 31 or 63 bits for unsigned integers restricted to the signed range
+                let size = self.element_size().unwrap();
+                (0..(1_u64 << bits))
+                    .prop_map(move |value| match size {
+                        4 => u32::try_from(value).unwrap().to_ne_bytes().to_vec(),
+                        _ => value.to_ne_bytes().to_vec(),
+                    })
+                    .boxed()
+            }
             Self::Float32 => (-1.0e6_f32..1.0e6)
                 .prop_map(|value| value.to_ne_bytes().to_vec())
                 .boxed(),
@@ -83,6 +96,14 @@ impl Values {
                 .boxed(),
             Self::Complex(values) => (values.element(), values.element())
                 .prop_map(|(re, im)| [re, im].concat())
+                .boxed(),
+            Self::Utf32(length) => prop::collection::vec(any::<char>(), *length)
+                .prop_map(|chars| {
+                    chars
+                        .into_iter()
+                        .flat_map(|char| u32::from(char).to_ne_bytes())
+                        .collect()
+                })
                 .boxed(),
             Self::String => "\\PC{0,6}".prop_map(String::into_bytes).boxed(),
             Self::Bytes => prop::collection::vec(any::<u8>(), 0..8).boxed(),
@@ -163,7 +184,7 @@ impl DataTypeCase {
 pub(crate) fn data_types() -> Vec<DataTypeCase> {
     use Values::{
         Bool, Byte, Bytes, Complex, Float32, Float64, Half, Int, LowBits, Optional, Raw, String,
-        UInt,
+        UInt, Utf32,
     };
     fn dt(
         label: &'static str,
@@ -356,6 +377,12 @@ pub(crate) fn data_types() -> Vec<DataTypeCase> {
             Int(64),
         ),
         dt("r24", data_type::raw_bits(3), zeros(3), Raw(3)),
+        dt(
+            "fixed_length_utf32",
+            data_type::fixed_length_utf32(NonZeroU64::new(12).unwrap()).unwrap(),
+            zeros(12),
+            Utf32(3),
+        ),
         dt("string", data_type::string(), "", String),
         dt("bytes", data_type::bytes(), Vec::<u8>::new(), Bytes),
         dt(
@@ -406,6 +433,9 @@ pub(crate) enum VlenKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodecKind {
     // Array-to-array
+    CastValue {
+        data_type: &'static str,
+    },
     FixedScaleOffset {
         astype: bool,
     },
@@ -445,6 +475,7 @@ pub(crate) enum CodecKind {
 impl std::fmt::Display for CodecKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::CastValue { data_type } => write!(f, "cast_value({data_type})"),
             Self::FixedScaleOffset { astype: false } => write!(f, "fixedscaleoffset"),
             Self::FixedScaleOffset { astype: true } => write!(f, "fixedscaleoffset(astype=u1)"),
             Self::Reshape => write!(f, "reshape"),
@@ -497,7 +528,11 @@ pub(crate) fn codec_kinds() -> Vec<CodecKind> {
         ZfpMode::FixedAccuracy,
         ZfpMode::Reversible,
     ];
-    let mut kinds = vec![
+    let mut kinds: Vec<CodecKind> = ["uint8", "int16", "int32", "float32", "float64"]
+        .into_iter()
+        .map(|data_type| C::CastValue { data_type })
+        .collect();
+    kinds.extend([
         C::FixedScaleOffset { astype: false },
         C::FixedScaleOffset { astype: true },
         C::Reshape,
@@ -513,7 +548,7 @@ pub(crate) fn codec_kinds() -> Vec<CodecKind> {
         C::Sharding {
             index_at_start: true,
         },
-    ];
+    ]);
     kinds.extend(zfp_modes.map(C::Zfp));
     kinds.extend(zfp_modes.map(C::Zfpy));
     kinds.extend(
@@ -564,6 +599,7 @@ impl CodecKind {
         match self {
             Self::FixedScaleOffset { .. } => data_type.numpy_dtype().is_some(),
             Self::BitRound
+            | Self::CastValue { .. }
             | Self::Bytes
             | Self::PackBits
             | Self::Pcodec
@@ -576,14 +612,22 @@ impl CodecKind {
         }
     }
 
-    fn is_lossy(self, data_type: &DataTypeCase) -> bool {
+    fn is_lossy(self) -> bool {
         match self {
-            Self::FixedScaleOffset { .. } | Self::BitRound => true,
-            // zfp clamps unsigned 32/64-bit integers to the signed range
-            Self::Zfp(mode) | Self::Zfpy(mode) => {
-                mode != ZfpMode::Reversible || matches!(data_type.label, "uint32" | "uint64")
-            }
+            Self::CastValue { .. } | Self::FixedScaleOffset { .. } | Self::BitRound => true,
+            Self::Zfp(mode) | Self::Zfpy(mode) => mode != ZfpMode::Reversible,
             _ => false,
+        }
+    }
+
+    /// The values to generate for a data type with this codec.
+    fn values(self, data_type: &DataTypeCase) -> Values {
+        match (self, &data_type.values) {
+            // zfp clamps unsigned 32/64-bit integers to the signed range
+            (Self::Zfp(_) | Self::Zfpy(_), Values::UInt(bits @ (32 | 64))) => {
+                Values::UInt(bits - 1)
+            }
+            (_, values) => values.clone(),
         }
     }
 }
@@ -622,6 +666,7 @@ pub(crate) struct CodecParams {
     rate: f64,
     precision: u32,
     tolerance: f64,
+    rounding: &'static str,
     inner_chunk_shape: Vec<u64>,
 }
 
@@ -641,6 +686,13 @@ impl CodecParams {
             prop::sample::select(vec![4.0_f64, 8.0, 16.0]),
             prop::sample::select(vec![8_u32, 16, 24]),
             prop::sample::select(vec![1e-3_f64, 1e-2, 0.1]),
+            prop::sample::select(vec![
+                "nearest-even",
+                "towards-zero",
+                "towards-positive",
+                "towards-negative",
+                "nearest-away",
+            ]),
             inner_chunk_shape,
         )
             .prop_map(
@@ -652,6 +704,7 @@ impl CodecParams {
                     rate,
                     precision,
                     tolerance,
+                    rounding,
                     inner_chunk_shape,
                 )| {
                     Self {
@@ -662,6 +715,7 @@ impl CodecParams {
                         rate,
                         precision,
                         tolerance,
+                        rounding,
                         inner_chunk_shape,
                     }
                 },
@@ -722,6 +776,7 @@ pub(crate) fn sample_cases(
     for (index, combination) in combinations.iter().enumerate() {
         let data_type = &data_types[combination.data_type];
         for _ in 0..samples {
+            let values = combination.codec.values(data_type);
             let strategy = (1_u64..=4, 1_u64..=4, 1_u64..=4, 1_u64..=4).prop_flat_map(
                 |(shape0, shape1, chunk0, chunk1)| {
                     let shape = vec![shape0, shape1];
@@ -731,7 +786,7 @@ pub(crate) fn sample_cases(
                         Just(shape),
                         CodecParams::strategy(&chunk_shape),
                         Just(chunk_shape),
-                        data_type.values.data(num_elements),
+                        values.data(num_elements),
                     )
                 },
             );
@@ -757,7 +812,7 @@ pub(crate) fn sample_cases(
                 chunk_shape,
                 metadata,
                 data,
-                lossy: combination.codec.is_lossy(data_type),
+                lossy: combination.codec.is_lossy(),
             });
         }
     }
@@ -769,9 +824,9 @@ fn bytes_codec() -> Value {
 }
 
 /// Generate the array metadata for a case.
-#[allow(clippy::too_many_lines)]
 ///
 /// The data type, fill value, and default codecs are those `zarrs` produces for the data type.
+#[allow(clippy::too_many_lines)]
 fn array_metadata(
     kind: CodecKind,
     params: &CodecParams,
@@ -818,6 +873,19 @@ fn array_metadata(
 
     let codecs: Vec<Value> = match kind {
         // Array-to-array
+        CodecKind::CastValue {
+            data_type: target_data_type,
+        } => {
+            let codec = json!({
+                "name": "cast_value",
+                "configuration": {
+                    "data_type": target_data_type,
+                    "rounding": p.rounding,
+                    "out_of_range": "clamp"
+                }
+            });
+            vec![codec, bytes_codec()]
+        }
         CodecKind::FixedScaleOffset { astype } => {
             let mut configuration = json!({
                 "offset": p.offset,
@@ -924,4 +992,88 @@ fn array_metadata(
     };
     metadata["codecs"] = Value::Array(codecs);
     Ok(metadata)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    /// Collect the `name` of every object in `value` (recursively), or `value` itself if it is a string.
+    fn collect_names(value: &Value, names: &mut BTreeSet<String>) {
+        match value {
+            Value::String(name) => {
+                names.insert(name.clone());
+            }
+            Value::Object(object) => {
+                if let Some(Value::String(name)) = object.get("name") {
+                    names.insert(name.clone());
+                }
+                for value in object.values().filter(|value| !value.is_string()) {
+                    collect_names(value, names);
+                }
+            }
+            Value::Array(array) => {
+                for value in array {
+                    collect_names(value, names);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The names of all codecs and data types in the metadata of a sample of every combination.
+    fn tested_names(key: &str) -> BTreeSet<String> {
+        let data_types = data_types();
+        let combinations = combinations(&codec_kinds(), &data_types);
+        let mut names = BTreeSet::new();
+        for case in sample_cases(&combinations, &data_types, 1, 0).unwrap() {
+            collect_names(&case.metadata[key], &mut names);
+        }
+        names
+    }
+
+    #[test]
+    fn all_codec_features_enabled() {
+        let zarrs_manifest = include_str!("../../zarrs/Cargo.toml");
+        let manifest = include_str!("../Cargo.toml");
+        for line in zarrs_manifest.lines().filter(|line| {
+            line.split_once('#').is_some_and(|(_, comment)| {
+                comment.contains("Enable")
+                    && comment.contains("codec")
+                    && !comment.contains("DEPRECATED")
+            })
+        }) {
+            let feature = line.split_whitespace().next().unwrap();
+            assert!(
+                manifest.contains(&format!("\"{feature}\"")),
+                "the zarrs codec feature `{feature}` is not enabled"
+            );
+        }
+    }
+
+    #[test]
+    fn all_registered_codecs_tested() {
+        let names = tested_names("codecs");
+        let untested = inventory::iter::<zarrs_codec::CodecPluginV3>()
+            .filter(|plugin| !names.iter().any(|name| plugin.match_name(name)))
+            .count();
+        assert_eq!(
+            untested, 0,
+            "{untested} registered codec(s) are not tested (tested: {names:?})"
+        );
+    }
+
+    #[test]
+    fn all_registered_data_types_tested() {
+        let names = tested_names("data_type");
+        let untested = inventory::iter::<zarrs_data_type::DataTypePluginV3>()
+            .filter(|plugin| !names.iter().any(|name| plugin.match_name(name)))
+            .count();
+        assert_eq!(
+            untested, 0,
+            "{untested} registered data type(s) are not tested (tested: {names:?})"
+        );
+    }
 }

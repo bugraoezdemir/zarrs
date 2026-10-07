@@ -36,3 +36,8 @@ zarrs = { path = "../zarrs", default-features = false, features = [
     "zlib",
     "zstd",
 ] }
+
+[dev-dependencies]
+inventory.workspace = true
+zarrs_codec.workspace = true
+zarrs_data_type.workspace = true
