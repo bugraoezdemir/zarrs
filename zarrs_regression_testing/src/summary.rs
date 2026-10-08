@@ -31,6 +31,49 @@ pub(crate) enum FailureKind {
     CurrentCannotWrite,
 }
 
+impl FailureKind {
+    /// The direction of the failure, independent of the release.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::CurrentToCurrent => "current→current",
+            Self::CurrentToRelease => "current→release",
+            Self::ReleaseToCurrent => "release→current",
+            Self::CurrentCannotWrite => "current cannot write",
+        }
+    }
+}
+
+/// The compatibility of a combination with the latest release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CombinationStatus {
+    /// Current and the latest release read each other's data.
+    Compatible,
+    /// Current reads back its own data, but the latest release cannot.
+    New,
+    /// Neither current nor the latest release can read back their own data.
+    Unsupported,
+    /// Anything else.
+    Other,
+}
+
+/// A row of concisely formatted failures: the releases affected for codecs and data types.
+pub(crate) struct ConciseRow {
+    pub(crate) kind: FailureKind,
+    pub(crate) releases: String,
+    pub(crate) codecs: String,
+    pub(crate) data_types: String,
+}
+
+/// A group of combinations with the same compatibility bounds.
+pub(crate) struct CompatibilityRow {
+    /// The bound of current→release compatibility.
+    pub(crate) forward: String,
+    /// The bound of release→current compatibility.
+    pub(crate) backward: String,
+    /// The combinations as merged codecs and data types.
+    pub(crate) combinations: Vec<(String, String)>,
+}
+
 /// A failure indicating a regression or bug.
 pub(crate) struct Failure {
     pub(crate) case: usize,
@@ -41,7 +84,7 @@ pub(crate) struct Failure {
 }
 
 impl Failure {
-    fn direction(&self) -> String {
+    pub(crate) fn direction(&self) -> String {
         let release = self
             .release
             .map(|release| release.to_string())
@@ -58,7 +101,7 @@ impl Failure {
     }
 
     /// The writer of the data (`current` or a release), i.e. its work subdirectory.
-    fn writer(&self) -> String {
+    pub(crate) fn writer(&self) -> String {
         match (self.kind, self.release) {
             (FailureKind::ReleaseToCurrent, Some(release)) => release.to_string(),
             _ => "current".to_string(),
@@ -67,7 +110,7 @@ impl Failure {
 }
 
 impl Run<'_> {
-    fn label(&self, combination: usize) -> (String, &'static str) {
+    pub(crate) fn label(&self, combination: usize) -> (String, &'static str) {
         let combination = &self.combinations[combination];
         (
             combination.codec.to_string(),
@@ -164,6 +207,18 @@ impl Run<'_> {
     /// Format failures concisely: the releases affected for each codec and data type.
     #[must_use]
     pub(crate) fn format_failures_concise(&self, failures: &[&Failure]) -> String {
+        let mut out = String::new();
+        for row in self.concise_rows(failures) {
+            let direction = row.kind.label();
+            let (releases, codecs, data_types) = (row.releases, row.codecs, row.data_types);
+            let _ = writeln!(out, "{direction:<20} {releases:<18} {codecs}: {data_types}");
+        }
+        out
+    }
+
+    /// Group failures by kind and the releases affected, with merged codecs and data types.
+    #[must_use]
+    pub(crate) fn concise_rows(&self, failures: &[&Failure]) -> Vec<ConciseRow> {
         // (kind, combination) -> releases
         let mut releases: BTreeMap<(FailureKind, usize), BTreeSet<Release>> = BTreeMap::new();
         for failure in failures {
@@ -190,19 +245,19 @@ impl Run<'_> {
                 .or_default()
                 .push(data_type);
         }
-        let mut out = String::new();
-        for ((kind, releases), codecs) in groups {
-            let direction = match kind {
-                FailureKind::CurrentToCurrent => "current→current",
-                FailureKind::CurrentToRelease => "current→release",
-                FailureKind::ReleaseToCurrent => "release→current",
-                FailureKind::CurrentCannotWrite => "current cannot write",
-            };
-            for (codecs, data_types) in self.merge_codecs(codecs) {
-                let _ = writeln!(out, "{direction:<20} {releases:<18} {codecs}: {data_types}");
-            }
-        }
-        out
+        groups
+            .into_iter()
+            .flat_map(|((kind, releases), codecs)| {
+                self.merge_codecs(codecs)
+                    .into_iter()
+                    .map(move |(codecs, data_types)| ConciseRow {
+                        kind,
+                        releases: releases.clone(),
+                        codecs,
+                        data_types,
+                    })
+            })
+            .collect()
     }
 
     /// Whether `direction` is compatible for all `results` (of a combination), for every release.
@@ -221,7 +276,7 @@ impl Run<'_> {
     }
 
     /// Describe the releases matching `include` (in the order of [`Run::releases`]) as ranges, e.g. `0.13–0.20`.
-    fn ranges(&self, include: &[bool]) -> Vec<String> {
+    pub(crate) fn ranges(&self, include: &[bool]) -> Vec<String> {
         let mut ranges = Vec::new();
         let mut index = 0;
         while index < include.len() {
@@ -310,7 +365,7 @@ impl Run<'_> {
     }
 
     /// The results of each combination.
-    fn by_combination(&self) -> Vec<Vec<&CaseResult>> {
+    pub(crate) fn by_combination(&self) -> Vec<Vec<&CaseResult>> {
         let mut by_combination: Vec<Vec<&CaseResult>> = vec![vec![]; self.combinations.len()];
         for (case, result) in self.cases.iter().zip(self.results) {
             by_combination[case.combination].push(result);
@@ -318,23 +373,34 @@ impl Run<'_> {
         by_combination
     }
 
+    /// The compatibility of a combination (with `results`) with the latest (first) release.
+    #[must_use]
+    pub(crate) fn status(results: &[&CaseResult]) -> CombinationStatus {
+        let all = |status: fn(&CaseResult) -> &Status| {
+            results.iter().all(|result| *status(result) == Status::Ok)
+        };
+        let current = all(|result| &result.current_roundtrip);
+        let release = all(|result| &result.releases[0].roundtrip);
+        let forward = all(|result| &result.releases[0].forward);
+        let backward = all(|result| &result.releases[0].backward);
+        match (current, release, forward && backward) {
+            (_, _, true) => CombinationStatus::Compatible,
+            (true, false, false) => CombinationStatus::New,
+            (false, false, false) => CombinationStatus::Unsupported,
+            _ => CombinationStatus::Other,
+        }
+    }
+
     /// Count combinations by their compatibility with the latest (first) release.
     #[must_use]
     pub(crate) fn counts(&self) -> String {
         let (mut compatible, mut new, mut unsupported, mut other) = (0, 0, 0, 0);
         for results in self.by_combination() {
-            let all = |status: fn(&CaseResult) -> &Status| {
-                results.iter().all(|result| *status(result) == Status::Ok)
-            };
-            let current = all(|result| &result.current_roundtrip);
-            let release = all(|result| &result.releases[0].roundtrip);
-            let forward = all(|result| &result.releases[0].forward);
-            let backward = all(|result| &result.releases[0].backward);
-            match (current, release, forward && backward) {
-                (_, _, true) => compatible += 1,
-                (true, false, false) => new += 1,
-                (false, false, false) => unsupported += 1,
-                _ => other += 1,
+            match Self::status(&results) {
+                CombinationStatus::Compatible => compatible += 1,
+                CombinationStatus::New => new += 1,
+                CombinationStatus::Unsupported => unsupported += 1,
+                CombinationStatus::Other => other += 1,
             }
         }
         format!(
@@ -343,38 +409,53 @@ impl Run<'_> {
         )
     }
 
-    /// Summarise how far back data compatibility extends for each combination.
+    /// How far back compatibility extends for a combination (with `results`), as the number of contiguous compatible releases from the newest and a description, for current→release and release→current.
+    ///
+    /// Returns [`None`] if neither current nor any release can write the combination.
     #[must_use]
-    pub(crate) fn compatibility(&self) -> String {
+    pub(crate) fn bounds(
+        &self,
+        results: &[&CaseResult],
+    ) -> Option<((usize, String), (usize, String))> {
+        let current_writes = results
+            .iter()
+            .any(|result| result.current_write_error.is_none());
+        let any_release_writes = results.iter().any(|result| {
+            result
+                .releases
+                .iter()
+                .any(|release| release.backward != Status::NotWritten)
+        });
+        if !current_writes && !any_release_writes {
+            return None;
+        }
+        let forward = if current_writes {
+            self.bound(
+                &self.compatible(results, |result, release| &result.releases[release].forward),
+            )
+        } else {
+            (0, "n/a".to_string())
+        };
+        let backward = self.bound(&self.compatible(results, |result, release| {
+            &result.releases[release].backward
+        }));
+        Some((forward, backward))
+    }
+
+    /// Group combinations by how far back data compatibility extends, and count the unsupported combinations.
+    #[must_use]
+    pub(crate) fn compatibility_rows(&self) -> (Vec<CompatibilityRow>, usize) {
         // (forward, backward) -> codec -> data types
         type Bounds = (usize, usize, String, String);
         let mut groups: BTreeMap<Bounds, BTreeMap<String, Vec<&str>>> = BTreeMap::new();
         let mut unsupported = 0;
         for (combination, results) in self.by_combination().into_iter().enumerate() {
-            let current_writes = results
-                .iter()
-                .any(|result| result.current_write_error.is_none());
-            let any_release_writes = results.iter().any(|result| {
-                result
-                    .releases
-                    .iter()
-                    .any(|release| release.backward != Status::NotWritten)
-            });
-            if !current_writes && !any_release_writes {
+            let Some(((forward_count, forward), (backward_count, backward))) =
+                self.bounds(&results)
+            else {
                 unsupported += 1;
                 continue;
-            }
-            let (forward_count, forward) = if current_writes {
-                self.bound(&self.compatible(&results, |result, release| {
-                    &result.releases[release].forward
-                }))
-            } else {
-                (0, "n/a".to_string())
             };
-            let (backward_count, backward) =
-                self.bound(&self.compatible(&results, |result, release| {
-                    &result.releases[release].backward
-                }));
             let (codec, data_type) = self.label(combination);
             groups
                 .entry((
@@ -388,7 +469,21 @@ impl Run<'_> {
                 .or_default()
                 .push(data_type);
         }
+        let rows = groups
+            .into_iter()
+            .map(|((_, _, forward, backward), codecs)| CompatibilityRow {
+                forward,
+                backward,
+                combinations: self.merge_codecs(codecs),
+            })
+            .collect();
+        (rows, unsupported)
+    }
 
+    /// Summarise how far back data compatibility extends for each combination.
+    #[must_use]
+    pub(crate) fn compatibility(&self) -> String {
+        let (rows, unsupported) = self.compatibility_rows();
         let mut out = String::new();
         let _ = writeln!(
             out,
@@ -404,10 +499,10 @@ impl Run<'_> {
             "{:<18} {:<18} combinations",
             "current→release", "release→current"
         );
-        for ((_, _, forward, backward), codecs) in groups {
-            for (index, (codecs, data_types)) in self.merge_codecs(codecs).into_iter().enumerate() {
+        for row in rows {
+            for (index, (codecs, data_types)) in row.combinations.into_iter().enumerate() {
                 let (forward, backward) = if index == 0 {
-                    (forward.as_str(), backward.as_str())
+                    (row.forward.as_str(), row.backward.as_str())
                 } else {
                     ("", "")
                 };
