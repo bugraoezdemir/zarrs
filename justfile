@@ -68,6 +68,11 @@ regression *args:
 regression_all *args:
     cargo +{{TOOLCHAIN}} run -p zarrs_regression_testing -- --all {{args}}
 
+# Write an HTML report of data compatibility testing (pass --all to include all releases) and open it
+regression_report *args:
+    -cargo +{{TOOLCHAIN}} run -p zarrs_regression_testing -- --html target/zarrs_regression_testing/report.html {{args}}
+    {{ if os() == "macos" { "open" } else { "xdg-open" } }} target/zarrs_regression_testing/report.html
+
 # Remove regression testing helpers and work directories
 regression_clean:
     rm -rf target/zarrs_regression_testing
