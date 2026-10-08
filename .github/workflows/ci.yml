@@ -48,14 +48,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Nightly is needed to resolve the dependencies of previous releases as of their release date
-      - uses: dtolnay/rust-toolchain@nightly
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          cache-directories: |
-            target/zarrs_regression_testing/helpers
-            target/zarrs_regression_testing/target
+          cache-directories: target/zarrs_regression_testing/target
       - run: cargo run -p zarrs_regression_testing
   build_wasm:
     runs-on: ubuntu-latest

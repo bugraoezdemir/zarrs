@@ -73,60 +73,51 @@ pub(crate) fn build(release: Release) -> Result<PathBuf, String> {
     let main = include_str!("../helper/main.rs.template").replace("__ADAPTER__", release.adapter());
     let manifest_path = project.join("Cargo.toml");
     let lockfile = project.join("Cargo.lock");
-    if write_if_changed(&manifest_path, &manifest)? {
-        // The lockfile was resolved for the previous manifest
-        match std::fs::remove_file(&lockfile) {
-            Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
-                return Err(format!("remove {}: {err}", lockfile.display()));
-            }
-            _ => {}
-        }
+    // The lockfile was resolved for the previous manifest
+    if write_if_changed(&manifest_path, &manifest)?
+        && let Err(err) = std::fs::remove_file(&lockfile)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(format!("remove {}: {err}", lockfile.display()));
     }
     write_if_changed(&project.join("src/main.rs"), &main)?;
     if let Some(publish_time) = publish_time
         && !lockfile.exists()
     {
-        generate_lockfile(&manifest_path, publish_time)?;
+        // `--publish-time` is unstable, and `$CARGO` is the current toolchain's cargo which cannot select another toolchain
+        run_cargo(
+            Command::new("cargo")
+                .args(["+nightly", "generate-lockfile", "-Zunstable-options"])
+                .arg("--publish-time")
+                .arg(publish_time)
+                .arg("--manifest-path")
+                .arg(&manifest_path),
+            &format!("generate lockfile for {name} (a nightly toolchain is required)"),
+        )?;
     }
 
-    let mut build = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()));
-    build.args(["build", "--quiet", "--manifest-path"]);
-    build.arg(&manifest_path).arg("--target-dir").arg(&target);
-    if publish_time.is_some() {
-        // Never re-resolve dependencies with the latest registry packages
-        build.arg("--locked");
-    }
-    let output = build
-        .output()
-        .map_err(|err| format!("run cargo for {name}: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "build {name} failed:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
+    run_cargo(
+        Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()))
+            .args(["build", "--quiet", "--manifest-path"])
+            .arg(&manifest_path)
+            .arg("--target-dir")
+            .arg(&target)
+            .args(publish_time.map(|_| "--locked")),
+        &format!("build {name}"),
+    )?;
     Ok(target
         .join("debug")
         .join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
 }
 
-/// Generate a lockfile that only considers registry packages published at or before `publish_time`.
-///
-/// `--publish-time` is unstable, so this requires a nightly toolchain (the helper is still built with the current toolchain).
-fn generate_lockfile(manifest_path: &Path, publish_time: &str) -> Result<(), String> {
-    // `$CARGO` is the current toolchain's cargo, which cannot select another toolchain
-    let output = Command::new("cargo")
-        .args(["+nightly", "generate-lockfile", "-Zunstable-options"])
-        .arg("--publish-time")
-        .arg(publish_time)
-        .arg("--manifest-path")
-        .arg(manifest_path)
+/// Run a cargo command to `what`, returning its stderr in the error if it fails.
+fn run_cargo(command: &mut Command, what: &str) -> Result<(), String> {
+    let output = command
         .output()
-        .map_err(|err| format!("run cargo +nightly generate-lockfile: {err}"))?;
+        .map_err(|err| format!("run cargo to {what}: {err}"))?;
     if !output.status.success() {
         return Err(format!(
-            "generate lockfile for {} failed (a nightly toolchain is required):\n{}",
-            manifest_path.display(),
+            "{what} failed:\n{}",
             String::from_utf8_lossy(&output.stderr)
         ));
     }
