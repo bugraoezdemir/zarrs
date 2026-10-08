@@ -7,7 +7,7 @@ pub(crate) struct Release(pub(crate) u32);
 /// Tested releases, newest first.
 ///
 /// The first entry is the latest release, which is tested in CI.
-/// Add new releases to the front of this list when they are published.
+/// Add new releases to the front of this list when they are published, and set [`Release::publish_time`] of the previous latest release.
 pub(crate) const RELEASES: &[Release] = &[
     Release(23),
     Release(22),
@@ -40,6 +40,39 @@ impl std::fmt::Display for Release {
 }
 
 impl Release {
+    /// The latest time at which registry packages are considered when resolving the dependencies of this release.
+    ///
+    /// This is the publish time of the last (non-yanked) patch release, so that the helper is built with dependencies available at the time.
+    /// It is `None` for the latest release, which is built with the latest dependencies.
+    ///
+    /// Cargo only respects the current yank state, so a release cannot be resolved if a dependency version required at the time has since been yanked.
+    /// In that case, the cutoff is the earliest time at which the dependencies resolve.
+    pub(crate) fn publish_time(self) -> Option<&'static str> {
+        match self.0 {
+            23.. => None,
+            22 => Some("2025-11-29T08:12:35Z"),
+            21 => Some("2025-06-19T12:42:22Z"),
+            20 => Some("2025-06-01T09:28:18Z"),
+            19 => Some("2025-02-13T00:09:54Z"),
+            18 => Some("2024-12-29T23:27:00Z"),
+            17 => Some("2024-10-17T20:42:06Z"),
+            16 => Some("2024-08-22T10:14:07Z"),
+            // `bytes` 1.6.0 has been yanked and was replaced by 1.6.1 two days after the last patch release
+            15 => Some("2024-07-14T00:00:00Z"),
+            14 => Some("2024-05-16T07:21:34Z"),
+            13 => Some("2024-05-07T22:25:43Z"),
+            12 => Some("2024-03-17T00:33:36Z"),
+            11 => Some("2024-02-06T00:26:32Z"),
+            // `futures-util` 0.3.29 and 0.3.30 (required by 0.7 to 0.10) have been yanked, so the dependencies only resolve from Oct 2024 (0.3.31)
+            7..=10 => Some("2024-10-16T00:00:00Z"),
+            6 => Some("2023-11-16T10:45:29Z"),
+            5 => Some("2023-10-09T22:27:01Z"),
+            4 => Some("2023-10-06T01:04:05Z"),
+            3 => Some("2023-09-27T11:17:26Z"),
+            _ => Some("2023-09-25T06:02:04Z"),
+        }
+    }
+
     /// The `zarrs` features enabled in the helper for this release.
     pub(crate) fn features(self) -> Vec<&'static str> {
         let minor = self.0;

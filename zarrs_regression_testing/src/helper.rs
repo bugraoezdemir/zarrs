@@ -1,6 +1,7 @@
 //! Helper binaries that read and write arrays with previous `zarrs` releases.
 //!
 //! Each helper is a generated crate depending on a single `zarrs` release, built into a shared target directory.
+//! Previous releases are built with the dependencies available when they were released (see [`Release::publish_time`]), which needs a nightly toolchain to generate the lockfile.
 //! A helper processes a batch of requests (a JSON array on stdin) and responds with a JSON array on stdout.
 
 use std::io::Write;
@@ -54,6 +55,7 @@ fn name(release: Release) -> String {
 pub(crate) fn build(release: Release) -> Result<PathBuf, String> {
     let root = root_dir();
     let name = name(release);
+    let publish_time = release.publish_time();
     let project = root.join("helpers").join(&name);
     let target = root.join("target");
     let features = release
@@ -66,16 +68,35 @@ pub(crate) fn build(release: Release) -> Result<PathBuf, String> {
         .replace("__NAME__", &name.replace('-', "_"))
         .replace("__BIN__", &name)
         .replace("__VERSION__", &release.to_string())
-        .replace("__FEATURES__", &format!("[{features}]"));
+        .replace("__FEATURES__", &format!("[{features}]"))
+        .replace("__PUBLISH_TIME__", publish_time.unwrap_or("none"));
     let main = include_str!("../helper/main.rs.template").replace("__ADAPTER__", release.adapter());
-    write_if_changed(&project.join("Cargo.toml"), &manifest)?;
+    let manifest_path = project.join("Cargo.toml");
+    let lockfile = project.join("Cargo.lock");
+    if write_if_changed(&manifest_path, &manifest)? {
+        // The lockfile was resolved for the previous manifest
+        match std::fs::remove_file(&lockfile) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                return Err(format!("remove {}: {err}", lockfile.display()));
+            }
+            _ => {}
+        }
+    }
     write_if_changed(&project.join("src/main.rs"), &main)?;
+    if let Some(publish_time) = publish_time
+        && !lockfile.exists()
+    {
+        generate_lockfile(&manifest_path, publish_time)?;
+    }
 
-    let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()))
-        .args(["build", "--quiet", "--manifest-path"])
-        .arg(project.join("Cargo.toml"))
-        .arg("--target-dir")
-        .arg(&target)
+    let mut build = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()));
+    build.args(["build", "--quiet", "--manifest-path"]);
+    build.arg(&manifest_path).arg("--target-dir").arg(&target);
+    if publish_time.is_some() {
+        // Never re-resolve dependencies with the latest registry packages
+        build.arg("--locked");
+    }
+    let output = build
         .output()
         .map_err(|err| format!("run cargo for {name}: {err}"))?;
     if !output.status.success() {
@@ -89,15 +110,40 @@ pub(crate) fn build(release: Release) -> Result<PathBuf, String> {
         .join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
 }
 
-fn write_if_changed(path: &Path, contents: &str) -> Result<(), String> {
+/// Generate a lockfile that only considers registry packages published at or before `publish_time`.
+///
+/// `--publish-time` is unstable, so this requires a nightly toolchain (the helper is still built with the current toolchain).
+fn generate_lockfile(manifest_path: &Path, publish_time: &str) -> Result<(), String> {
+    // `$CARGO` is the current toolchain's cargo, which cannot select another toolchain
+    let output = Command::new("cargo")
+        .args(["+nightly", "generate-lockfile", "-Zunstable-options"])
+        .arg("--publish-time")
+        .arg(publish_time)
+        .arg("--manifest-path")
+        .arg(manifest_path)
+        .output()
+        .map_err(|err| format!("run cargo +nightly generate-lockfile: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "generate lockfile for {} failed (a nightly toolchain is required):\n{}",
+            manifest_path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Write `contents` to `path` if they differ from the existing contents, returning whether the file was written.
+fn write_if_changed(path: &Path, contents: &str) -> Result<bool, String> {
     if std::fs::read_to_string(path).is_ok_and(|existing| existing == contents) {
-        return Ok(());
+        return Ok(false);
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|err| format!("create {}: {err}", parent.display()))?;
     }
-    std::fs::write(path, contents).map_err(|err| format!("write {}: {err}", path.display()))
+    std::fs::write(path, contents).map_err(|err| format!("write {}: {err}", path.display()))?;
+    Ok(true)
 }
 
 /// Run a batch of requests with a helper, returning a response for each request.

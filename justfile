@@ -64,7 +64,7 @@ _coverage_file:
 regression *args:
     cargo +{{TOOLCHAIN}} run -p zarrs_regression_testing -- {{args}}
 
-# Determine how far back data compatibility extends across all tested zarrs releases
+# Determine how far back data compatibility extends across all tested zarrs releases (requires a nightly toolchain to resolve dependencies as of each release)
 regression_all *args:
     cargo +{{TOOLCHAIN}} run -p zarrs_regression_testing -- --all {{args}}
 
