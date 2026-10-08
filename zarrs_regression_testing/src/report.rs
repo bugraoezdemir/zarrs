@@ -13,7 +13,7 @@ use zarrs::array::FillValue;
 use crate::cases::{DataTypeCase, Values};
 use crate::data::Data;
 use crate::releases::Release;
-use crate::run::case_dir;
+use crate::run::{CaseResult, Status, case_dir};
 use crate::summary::{CombinationStatus, Failure, FailureKind, Run};
 
 /// The parameters of a run.
@@ -126,6 +126,8 @@ table.matrix thead th:first-child { left: 0; z-index: 2; }
 table.matrix td { width: 13px; min-width: 13px; height: 13px; padding: 0; border-radius: 2px; }
 table.matrix td a { display: block; width: 100%; height: 100%; }
 table.matrix tr:hover th { color: var(--new); }
+.since { display: inline-block; min-inline-size: 2.8em; text-align: end; color: var(--muted); font-size: 10px; }
+.since-new { color: var(--new); font-weight: 600; }
 .regression { background: var(--regression); }
 .known { background: var(--known); }
 .older { background: var(--older); }
@@ -530,11 +532,12 @@ fn header(
     );
 }
 
-/// The overview matrix of codecs (rows) and data types (columns).
-///
-/// Combinations with `failures` have the status of the most severe failure, otherwise their status with the latest release.
-fn overview(out: &mut String, run: &Run, failures: [(&[&Failure], Cell); 3], meta: &Meta) {
-    let by_combination = run.by_combination();
+/// The status of each combination: that of its most severe failure, otherwise its status with the latest release.
+fn cells(
+    run: &Run,
+    by_combination: &[Vec<&CaseResult>],
+    failures: [(&[&Failure], Cell); 3],
+) -> Vec<Cell> {
     let mut cells: Vec<Cell> = by_combination
         .iter()
         .map(|results| match Run::status(results) {
@@ -550,6 +553,15 @@ fn overview(out: &mut String, run: &Run, failures: [(&[&Failure], Cell); 3], met
             cells[combination] = cells[combination].min(cell);
         }
     }
+    cells
+}
+
+/// The overview matrix of codecs (rows) and data types (columns).
+///
+/// Combinations with `failures` have the status of the most severe failure, otherwise their status with the latest release.
+fn overview(out: &mut String, run: &Run, failures: [(&[&Failure], Cell); 3], meta: &Meta) {
+    let by_combination = run.by_combination();
+    let cells = cells(run, &by_combination, failures);
     let mut codecs: Vec<String> = Vec::new();
     let mut data_types: BTreeSet<usize> = BTreeSet::new();
     let mut index: HashMap<(String, usize), usize> = HashMap::new();
@@ -562,7 +574,18 @@ fn overview(out: &mut String, run: &Run, failures: [(&[&Failure], Cell); 3], met
         index.insert((codec, combination.data_type), combination_index);
     }
 
-    out.push_str("<details class=\"section\" open><summary><h2>Overview</h2> <span class=\"muted\">codecs × data types, compared with the latest release</span></summary>\n<p class=\"legend\">");
+    let labels = if meta.all {
+        "the oldest tested release that supports the codec or data type, or <span class=\"since since-new\">new</span> if none do".to_string()
+    } else {
+        format!(
+            "<span class=\"since since-new\">new</span> if not supported by {} (run with <code>--all</code> for when each was introduced)",
+            run.releases[0]
+        )
+    };
+    let _ = write!(
+        out,
+        "<details class=\"section\" open><summary><h2>Overview</h2> <span class=\"muted\">codecs × data types, compared with the latest release; labelled with {labels}</span></summary>\n<p class=\"legend\">"
+    );
     for cell in Cell::ALL {
         let count = cells.iter().filter(|&&other| other == cell).count();
         if count > 0 || cell != Cell::Older || meta.all {
@@ -576,15 +599,30 @@ fn overview(out: &mut String, run: &Run, failures: [(&[&Failure], Cell); 3], met
     }
     out.push_str("<span class=\"item muted\">blank: not applicable</span></p>\n<div class=\"matrix-wrap\"><table class=\"matrix\">\n<thead><tr><th></th>");
     for &data_type in &data_types {
+        let combinations = run
+            .combinations
+            .iter()
+            .enumerate()
+            .filter(|(_, combination)| combination.data_type == data_type)
+            .map(|(combination, _)| combination);
         let _ = write!(
             out,
-            "<th><div>{}</div></th>",
-            escape(run.data_types[data_type].label)
+            "<th><div>{}{}</div></th>",
+            escape(run.data_types[data_type].label),
+            since(run, &by_combination, combinations, meta.all)
         );
     }
     out.push_str("</tr></thead>\n<tbody>\n");
     for codec in &codecs {
-        let _ = write!(out, "<tr><th>{}</th>", escape(codec));
+        let combinations = data_types
+            .iter()
+            .filter_map(|&data_type| index.get(&(codec.clone(), data_type)).copied());
+        let _ = write!(
+            out,
+            "<tr><th>{}{}</th>",
+            escape(codec),
+            since(run, &by_combination, combinations, meta.all)
+        );
         for &data_type in &data_types {
             let Some(&combination) = index.get(&(codec.clone(), data_type)) else {
                 out.push_str("<td></td>");
@@ -619,6 +657,37 @@ fn overview(out: &mut String, run: &Run, failures: [(&[&Failure], Cell); 3], met
         out.push_str("</tr>\n");
     }
     out.push_str("</tbody></table></div>\n</details>\n");
+}
+
+/// A label of the oldest tested release that reads back its own data for any of `combinations` (if `all` releases are tested), or `new` if none do but current does.
+fn since(
+    run: &Run,
+    by_combination: &[Vec<&CaseResult>],
+    combinations: impl Iterator<Item = usize>,
+    all: bool,
+) -> String {
+    let results: Vec<&CaseResult> = combinations
+        .flat_map(|combination| by_combination[combination].iter().copied())
+        .collect();
+    let oldest = results
+        .iter()
+        .filter_map(|result| {
+            result
+                .releases
+                .iter()
+                .rposition(|release| release.roundtrip == Status::Ok)
+        })
+        .max();
+    match oldest {
+        Some(oldest) if all => format!(" <span class=\"since\">{}</span>", run.releases[oldest]),
+        None if results
+            .iter()
+            .any(|result| result.current_roundtrip == Status::Ok) =>
+        {
+            " <span class=\"since since-new\">new</span>".to_string()
+        }
+        _ => String::new(),
+    }
 }
 
 /// Describe the failures of a kind, e.g. `current→0.13–0.20`.
