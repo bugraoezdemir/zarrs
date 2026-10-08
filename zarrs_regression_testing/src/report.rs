@@ -8,6 +8,9 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use zarrs::array::FillValue;
+
+use crate::cases::{DataTypeCase, Values};
 use crate::data::Data;
 use crate::releases::Release;
 use crate::run::case_dir;
@@ -191,18 +194,34 @@ fn truncate(text: &str, max: usize) -> String {
     }
 }
 
-/// Format data as a grid of hex elements in the shape of the array, followed by any validity masks.
-fn format_data(data: &Data, shape: &[u64], element_size: Option<usize>) -> String {
-    let elements: Vec<String> = if let Some(offsets) = &data.offsets {
+/// Format the elements and bytes of data as grids in the shape of the array.
+fn format_data(data: &Data, shape: &[u64], data_type: &DataTypeCase) -> String {
+    let element_bytes: Vec<&[u8]> = if let Some(offsets) = &data.offsets {
         offsets
             .windows(2)
-            .map(|window| hex(&data.bytes[window[0]..window[1]]))
+            .map(|window| &data.bytes[window[0]..window[1]])
             .collect()
-    } else if let Some(size) = element_size.filter(|&size| size > 0) {
-        data.bytes.chunks(size).map(hex).collect()
+    } else if let Some(size) = data_type.values.element_size().filter(|&size| size > 0) {
+        data.bytes.chunks(size).collect()
     } else {
-        vec![hex(&data.bytes)]
+        vec![&data.bytes]
     };
+    let elements: Vec<String> = element_bytes
+        .iter()
+        .enumerate()
+        .map(|(index, bytes)| {
+            // A null at depth `n` (outermost first) is wrapped `n` times, as in fill value metadata
+            match data
+                .masks
+                .iter()
+                .position(|mask| mask.get(index) == Some(&0))
+            {
+                Some(depth) => format!("{}null{}", "[".repeat(depth), "]".repeat(depth)),
+                None => format_element(data_type, bytes),
+            }
+        })
+        .collect();
+    let bytes: Vec<String> = element_bytes.iter().map(|bytes| hex(bytes)).collect();
     let columns = shape
         .last()
         .and_then(|&columns| usize::try_from(columns).ok())
@@ -225,27 +244,60 @@ fn format_data(data: &Data, shape: &[u64], element_size: Option<usize>) -> Strin
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let mut out = format!(
-        "{} elements, {} bytes{}\n{}",
+    format!(
+        "{} elements ({})\n{}\n\n{} bytes{} (hex)\n{}",
         elements.len(),
+        data_type.label,
+        grid(&elements),
         data.bytes.len(),
         if data.offsets.is_some() {
-            " (variable length)"
+            ", variable length"
         } else {
             ""
         },
-        grid(&elements)
-    );
-    for (index, mask) in data.masks.iter().enumerate() {
-        let mask: Vec<String> = mask.iter().map(u8::to_string).collect();
-        let _ = write!(
-            out,
-            "\n\nvalidity mask {index}{}\n{}",
-            if index == 0 { " (outermost)" } else { "" },
-            grid(&mask)
-        );
+        grid(&bytes)
+    )
+}
+
+/// Format the bytes of a (non-null) element as in fill value metadata (e.g. `-1`, `1.5`, `NaN`, `"text"`), with complex numbers as `1.5-2j`.
+///
+/// Raw bits and bytes, and elements that cannot be formatted, are formatted in hex.
+fn format_element(data_type: &DataTypeCase, bytes: &[u8]) -> String {
+    let mut inner = &data_type.data_type;
+    while let Some(optional_inner) = inner.optional_inner() {
+        inner = optional_inner;
     }
-    out
+    let mut values = &data_type.values;
+    while let Values::Optional(optional_values) = values {
+        values = optional_values;
+    }
+    if matches!(values, Values::Raw(_) | Values::Bytes) {
+        return hex(bytes);
+    }
+    let Some(value) = inner
+        .metadata_fill_value(&FillValue::new(bytes.to_vec()))
+        .ok()
+        .and_then(|metadata| serde_json::to_value(metadata).ok())
+    else {
+        return hex(bytes);
+    };
+    // Strings are quoted with non-printable characters (e.g. bidirectional overrides) escaped, but not special values (e.g. `NaN`, `NaT`)
+    let quote = matches!(values, Values::String | Values::Utf32(_));
+    let scalar = |value: &Value| match value {
+        Value::String(string) if quote => format!("{string:?}"),
+        Value::String(string) => string.clone(),
+        value => value.to_string(),
+    };
+    match value.as_array().map(Vec::as_slice) {
+        Some([re, im]) => {
+            let (re, im) = (scalar(re), scalar(im));
+            match im.strip_prefix('-') {
+                Some(im) => format!("{re}-{im}j"),
+                None => format!("{re}+{im}j"),
+            }
+        }
+        _ => scalar(&value),
+    }
 }
 
 /// Format JSON with indentation, keeping short arrays and objects on one line.
@@ -784,11 +836,7 @@ fn case_details(
         out,
         "<div>codecs <code>{}</code></div>\n<details><summary>input data</summary><pre>{}</pre></details>\n<details><summary>array metadata</summary><pre>{}</pre></details>\n</div>\n",
         escape(&codecs),
-        escape(&format_data(
-            &case.data,
-            &case.shape,
-            data_type.values.element_size()
-        )),
+        escape(&format_data(&case.data, &case.shape, data_type)),
         escape(&metadata)
     );
 }
@@ -909,23 +957,82 @@ mod tests {
 
     #[test]
     fn data_grid() {
-        let data = Data {
-            bytes: vec![0, 1, 2, 3, 4, 5, 6, 7],
-            offsets: None,
-            masks: vec![vec![1, 0, 1, 1]],
+        let data_types = cases::data_types();
+        let data_type = |label: &str| {
+            data_types
+                .iter()
+                .find(|data_type| data_type.label == label)
+                .unwrap()
         };
+        let elements = |label: &str, elements: &[&[u8]], masks: Vec<Vec<u8>>| {
+            let variable = data_type(label).values.element_size().is_none();
+            let elements: Vec<Vec<u8>> = elements.iter().map(|element| element.to_vec()).collect();
+            let data = Data::from_elements(&elements, variable, masks);
+            let shape = [1, elements.len() as u64];
+            let formatted = format_data(&data, &shape, data_type(label));
+            formatted.lines().nth(1).unwrap().to_string()
+        };
+        let int16 = |value: i16| value.to_ne_bytes();
         assert_eq!(
-            format_data(&data, &[2, 2], Some(2)),
-            "4 elements, 8 bytes\n0001 0203\n0405 0607\n\nvalidity mask 0 (outermost)\n1 0\n1 1"
+            elements("int16", &[&int16(-2), &int16(300)], vec![]),
+            " -2 300"
         );
-        let data = Data {
-            bytes: b"abc".to_vec(),
-            offsets: Some(vec![0, 0, 3]),
-            masks: vec![],
-        };
+        assert_eq!(elements("int4", &[&[0xf9]], vec![]), "-7");
+        assert_eq!(elements("bool", &[&[0], &[1]], vec![]), "false  true");
+        let float32 = |value: f32| value.to_ne_bytes();
         assert_eq!(
-            format_data(&data, &[1, 2], None),
-            "2 elements, 3 bytes (variable length)\n     ∅ 616263"
+            elements("float32", &[&float32(1.5), &float32(f32::NAN)], vec![]),
+            "1.5 NaN"
+        );
+        assert_eq!(
+            elements("float16", &[&[0x00, 0x3c], &[0x00, 0xfc]], vec![]),
+            "      1.0 -Infinity"
+        );
+        assert_eq!(elements("float8_e4m3", &[&[0x38]], vec![]), "1.0");
+        assert_eq!(
+            elements(
+                "complex64",
+                &[&[float32(1.5), float32(-2.0)].concat()],
+                vec![]
+            ),
+            "1.5-2.0j"
+        );
+        assert_eq!(
+            elements(
+                "numpy.datetime64",
+                &[&i64::MIN.to_ne_bytes(), &7_i64.to_ne_bytes()],
+                vec![]
+            ),
+            "NaT   7"
+        );
+        assert_eq!(elements("r24", &[&[1, 2, 255]], vec![]), "0102ff");
+        assert_eq!(elements("bytes", &[b"", b"ab"], vec![]), "   ∅ 6162");
+        assert_eq!(
+            elements("string", &[b"a\"b", b""], vec![]),
+            "\"a\\\"b\"     \"\""
+        );
+        assert_eq!(
+            elements("string", &["a\u{202e}".as_bytes()], vec![]),
+            "\"a\\u{202e}\""
+        );
+        let utf32: Vec<u8> = "ab\0"
+            .chars()
+            .flat_map(|char| u32::from(char).to_ne_bytes())
+            .collect();
+        assert_eq!(elements("fixed_length_utf32", &[&utf32], vec![]), "\"ab\"");
+        assert_eq!(
+            elements(
+                "optional<optional<float32>>",
+                &[&float32(0.0), &float32(0.0), &float32(2.5)],
+                vec![vec![0, 1, 1], vec![1, 0, 1]],
+            ),
+            "  null [null]    2.5"
+        );
+
+        let data = Data::from_elements(&[int16(1).to_vec(), int16(-1).to_vec()], false, vec![]);
+        assert_eq!(
+            format_data(&data, &[2, 1], data_type("int16")),
+            "2 elements (int16)\n 1\n-1\n\n4 bytes (hex)\n0100\nffff"
         );
     }
 }
