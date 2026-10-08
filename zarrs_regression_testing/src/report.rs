@@ -679,7 +679,12 @@ fn combination_matrix(
     );
     for cell in Cell::ALL {
         let count = cells.iter().filter(|&&other| other == cell).count();
-        if count > 0 || cell != Cell::Older || meta.all {
+        let optional = match cell {
+            Cell::KnownIssue => true,
+            Cell::Older => !meta.all,
+            _ => false,
+        };
+        if count > 0 || !optional {
             let _ = write!(
                 out,
                 "<span class=\"item\"><span class=\"swatch {}\"></span>{} ({count})</span>",
@@ -771,6 +776,9 @@ fn release_matrix(
         Cell::Partial,
         Cell::Unsupported,
     ] {
+        if cell == Cell::KnownIssue && !failed.values().any(|&failed| failed == cell) {
+            continue;
+        }
         let label = match cell {
             Cell::Compatible => format!("all {noun} supported"),
             Cell::Partial => format!("some {noun} unsupported"),
