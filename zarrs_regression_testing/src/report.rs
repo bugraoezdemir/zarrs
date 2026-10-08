@@ -33,6 +33,8 @@ enum Cell {
     Other,
     New,
     Unsupported,
+    /// Some combinations of a row are supported by a release (release views only).
+    Partial,
     Compatible,
 }
 
@@ -55,6 +57,7 @@ impl Cell {
             Self::Other => "other",
             Self::New => "new",
             Self::Unsupported => "unsupported",
+            Self::Partial => "partial",
             Self::Compatible => "compatible",
         }
     }
@@ -67,6 +70,7 @@ impl Cell {
             Self::Other => "other",
             Self::New => "new/fixed in current",
             Self::Unsupported => "unsupported",
+            Self::Partial => "partially supported",
             Self::Compatible => "compatible",
         }
     }
@@ -85,10 +89,10 @@ impl Cell {
 const STYLE: &str = r"
 :root { --fg: #1f2328; --muted: #656d76; --bg: #fff; --panel: #f6f8fa; --border: #d0d7de;
   --regression: #cf222e; --known: #e16f24; --older: #d4a72c; --other: #8250df; --new: #0969da;
-  --unsupported: #d0d7de; --compatible: #2da44e; }
+  --unsupported: #d0d7de; --partial: #9be9a8; --compatible: #2da44e; }
 @media (prefers-color-scheme: dark) {
   :root { --fg: #e6edf3; --muted: #8d96a0; --bg: #0d1117; --panel: #161b22; --border: #30363d;
-    --unsupported: #30363d; }
+    --unsupported: #30363d; --partial: #196c2e; }
 }
 body { font: 14px/1.45 system-ui, sans-serif; color: var(--fg); background: var(--bg); margin: 1.5em auto; max-width: 1400px; padding: 0 1em; }
 h1 { margin: 0; font-size: 1.6em; }
@@ -127,6 +131,7 @@ table.matrix td { width: 13px; min-width: 13px; height: 13px; padding: 0; border
 table.matrix td a { display: block; width: 100%; height: 100%; }
 table.matrix tr:hover th { color: var(--new); }
 .since { display: inline-block; min-inline-size: 2.8em; text-align: end; color: var(--muted); font-size: 10px; }
+thead .since { text-align: start; }
 .since-new { color: var(--new); font-weight: 600; }
 .regression { background: var(--regression); }
 .known { background: var(--known); }
@@ -134,13 +139,23 @@ table.matrix tr:hover th { color: var(--new); }
 .other { background: var(--other); }
 .new { background: var(--new); }
 .unsupported { background: var(--unsupported); }
+.partial { background: var(--partial); }
 .compatible { background: var(--compatible); }
+.views button { font: inherit; margin-right: .4em; }
+.views button[aria-pressed=true] { font-weight: 600; }
+table.releases td { width: 26px; min-width: 26px; }
+table.releases thead th div { writing-mode: horizontal-tb; transform: none; padding: 0 2px; }
 ";
 
 const SCRIPT: &str = r"
 function setAll(open) {
   document.querySelectorAll(open ? 'details.section, details.combination' : 'details.combination')
     .forEach(details => details.open = open);
+}
+function showView(id) {
+  document.querySelectorAll('.view').forEach(view => view.hidden = view.id !== id);
+  document.querySelectorAll('.views button')
+    .forEach(button => button.setAttribute('aria-pressed', button.dataset.view === id));
 }
 function reveal() {
   const target = location.hash && document.getElementById(location.hash.slice(1));
@@ -556,24 +571,100 @@ fn cells(
     cells
 }
 
-/// The overview matrix of codecs (rows) and data types (columns).
-///
-/// Combinations with `failures` have the status of the most severe failure, otherwise their status with the latest release.
+/// The overview: matrices of codecs × data types, codecs × releases, and data types × releases.
 fn overview(out: &mut String, run: &Run, failures: [(&[&Failure], Cell); 3], meta: &Meta) {
     let by_combination = run.by_combination();
+    // (combination, release or current) -> most severe failure
+    let mut failed: HashMap<(usize, Option<Release>), Cell> = HashMap::new();
+    for (failures, cell) in failures {
+        for failure in failures {
+            let release = failure
+                .release
+                .filter(|_| failure.kind != FailureKind::CurrentToCurrent);
+            let entry = failed
+                .entry((run.cases[failure.case].combination, release))
+                .or_insert(cell);
+            *entry = (*entry).min(cell);
+        }
+    }
     let cells = cells(run, &by_combination, failures);
-    let mut codecs: Vec<String> = Vec::new();
-    let mut data_types: BTreeSet<usize> = BTreeSet::new();
-    let mut index: HashMap<(String, usize), usize> = HashMap::new();
+
+    let mut codecs: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut data_types: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (combination_index, combination) in run.combinations.iter().enumerate() {
         let codec = combination.codec.to_string();
-        if !codecs.contains(&codec) {
-            codecs.push(codec.clone());
+        match codecs.last_mut() {
+            Some((last, combinations)) if *last == codec => combinations.push(combination_index),
+            _ => codecs.push((codec, vec![combination_index])),
         }
-        data_types.insert(combination.data_type);
-        index.insert((codec, combination.data_type), combination_index);
+        data_types
+            .entry(combination.data_type)
+            .or_default()
+            .push(combination_index);
     }
+    let data_types: Vec<(String, Vec<usize>)> = data_types
+        .into_iter()
+        .map(|(data_type, combinations)| {
+            (run.data_types[data_type].label.to_string(), combinations)
+        })
+        .collect();
 
+    out.push_str(
+        "<details class=\"section\" open><summary><h2>Overview</h2></summary>\n<p class=\"views\">",
+    );
+    for (id, label, pressed) in [
+        ("view-combinations", "codecs × data types", true),
+        ("view-codecs", "codecs × releases", false),
+        ("view-data-types", "data types × releases", false),
+    ] {
+        let _ = write!(
+            out,
+            "<button data-view=\"{id}\" aria-pressed=\"{pressed}\" onclick=\"showView(this.dataset.view)\">{label}</button>"
+        );
+    }
+    out.push_str("</p>\n<div class=\"view\" id=\"view-combinations\">\n");
+    combination_matrix(
+        out,
+        run,
+        &by_combination,
+        &cells,
+        &codecs,
+        &data_types,
+        meta,
+    );
+    out.push_str("</div>\n<div class=\"view\" id=\"view-codecs\" hidden>\n");
+    release_matrix(
+        out,
+        run,
+        &by_combination,
+        &failed,
+        &codecs,
+        "data types",
+        meta,
+    );
+    out.push_str("</div>\n<div class=\"view\" id=\"view-data-types\" hidden>\n");
+    release_matrix(
+        out,
+        run,
+        &by_combination,
+        &failed,
+        &data_types,
+        "codecs",
+        meta,
+    );
+    out.push_str("</div>\n</details>\n");
+}
+
+/// A matrix of `codecs` (rows) and `data_types` (columns), with their combinations.
+fn combination_matrix(
+    out: &mut String,
+    run: &Run,
+    by_combination: &[Vec<&CaseResult>],
+    cells: &[Cell],
+    codecs: &[(String, Vec<usize>)],
+    data_types: &[(String, Vec<usize>)],
+    meta: &Meta,
+) {
     let labels = if meta.all {
         "the oldest tested release that supports the codec or data type, or <span class=\"since since-new\">new</span> if none do".to_string()
     } else {
@@ -584,7 +675,7 @@ fn overview(out: &mut String, run: &Run, failures: [(&[&Failure], Cell); 3], met
     };
     let _ = write!(
         out,
-        "<details class=\"section\" open><summary><h2>Overview</h2> <span class=\"muted\">codecs × data types, compared with the latest release; labelled with {labels}</span></summary>\n<p class=\"legend\">"
+        "<p class=\"muted\">Compared with the latest release; labelled with {labels}.</p>\n<p class=\"legend\">"
     );
     for cell in Cell::ALL {
         let count = cells.iter().filter(|&&other| other == cell).count();
@@ -598,42 +689,37 @@ fn overview(out: &mut String, run: &Run, failures: [(&[&Failure], Cell); 3], met
         }
     }
     out.push_str("<span class=\"item muted\">blank: not applicable</span></p>\n<div class=\"matrix-wrap\"><table class=\"matrix\">\n<thead><tr><th></th>");
-    for &data_type in &data_types {
-        let combinations = run
-            .combinations
-            .iter()
-            .enumerate()
-            .filter(|(_, combination)| combination.data_type == data_type)
-            .map(|(combination, _)| combination);
+    for (data_type, combinations) in data_types {
         let _ = write!(
             out,
-            "<th><div>{}{}</div></th>",
-            escape(run.data_types[data_type].label),
-            since(run, &by_combination, combinations, meta.all)
+            "<th><div>{} {}</div></th>",
+            since(run, by_combination, combinations.iter().copied(), meta.all),
+            escape(data_type)
         );
     }
     out.push_str("</tr></thead>\n<tbody>\n");
-    for codec in &codecs {
-        let combinations = data_types
-            .iter()
-            .filter_map(|&data_type| index.get(&(codec.clone(), data_type)).copied());
+    for (codec, codec_combinations) in codecs {
         let _ = write!(
             out,
-            "<tr><th>{}{}</th>",
+            "<tr><th>{} {}</th>",
             escape(codec),
-            since(run, &by_combination, combinations, meta.all)
+            since(
+                run,
+                by_combination,
+                codec_combinations.iter().copied(),
+                meta.all
+            )
         );
-        for &data_type in &data_types {
-            let Some(&combination) = index.get(&(codec.clone(), data_type)) else {
+        for (data_type, combinations) in data_types {
+            let Some(&combination) = combinations
+                .iter()
+                .find(|combination| codec_combinations.contains(combination))
+            else {
                 out.push_str("<td></td>");
                 continue;
             };
             let cell = cells[combination];
-            let mut title = format!(
-                "{codec} × {}: {}",
-                run.data_types[data_type].label,
-                cell.label()
-            );
+            let mut title = format!("{codec} × {data_type}: {}", cell.label());
             if meta.all
                 && let Some(((_, forward), (_, backward))) =
                     run.bounds(&by_combination[combination])
@@ -643,23 +729,174 @@ fn overview(out: &mut String, run: &Run, failures: [(&[&Failure], Cell); 3], met
                     "\ncurrent→release: {forward}\nrelease→current: {backward}"
                 );
             }
-            let _ = write!(
-                out,
-                "<td class=\"{}\" title=\"{}\">",
-                cell.class(),
-                escape(&title)
-            );
-            if let Some(prefix) = cell.anchor() {
-                let _ = write!(out, "<a href=\"#{prefix}{combination}\"></a>");
-            }
-            out.push_str("</td>");
+            cell_html(out, cell, &title, combination);
         }
         out.push_str("</tr>\n");
     }
-    out.push_str("</tbody></table></div>\n</details>\n");
+    out.push_str("</tbody></table></div>\n");
+}
+
+/// A matrix of `rows` (with their combinations, e.g. a codec and its data types) and releases (oldest first, then current).
+///
+/// A cell has the status of the most severe failure of its combinations, otherwise whether the release reads back its own data for all, some, or none of the combinations that current supports.
+/// Current is compared with the combinations that any release supports.
+fn release_matrix(
+    out: &mut String,
+    run: &Run,
+    by_combination: &[Vec<&CaseResult>],
+    failed: &HashMap<(usize, Option<Release>), Cell>,
+    rows: &[(String, Vec<usize>)],
+    noun: &str,
+    meta: &Meta,
+) {
+    let columns: Vec<Option<usize>> = (0..run.releases.len())
+        .rev()
+        .map(Some)
+        .chain([None])
+        .collect();
+    let _ = write!(
+        out,
+        "<p class=\"muted\">Whether each release reads back its own data for the {noun} of each row that current zarrs supports, and whether it is compatible with current zarrs. Current zarrs is compared with the {noun} supported by any tested release.{}</p>\n<p class=\"legend\">",
+        if meta.all {
+            ""
+        } else {
+            " Run with <code>--all</code> to test every release."
+        }
+    );
+    for cell in [
+        Cell::Regression,
+        Cell::KnownIssue,
+        Cell::Older,
+        Cell::Compatible,
+        Cell::Partial,
+        Cell::Unsupported,
+    ] {
+        let label = match cell {
+            Cell::Compatible => format!("all {noun} supported"),
+            Cell::Partial => format!("some {noun} unsupported"),
+            Cell::Unsupported => format!("no {noun} supported"),
+            cell => cell.label().to_string(),
+        };
+        let _ = write!(
+            out,
+            "<span class=\"item\"><span class=\"swatch {}\"></span>{label}</span>",
+            cell.class()
+        );
+    }
+    out.push_str(
+        "</p>\n<div class=\"matrix-wrap\"><table class=\"matrix releases\">\n<thead><tr><th></th>",
+    );
+    for column in &columns {
+        let _ = write!(
+            out,
+            "<th><div>{}</div></th>",
+            column.map_or_else(
+                || "current".to_string(),
+                |index| run.releases[index].to_string()
+            )
+        );
+    }
+    out.push_str("</tr></thead>\n<tbody>\n");
+    for (row, combinations) in rows {
+        let _ = write!(out, "<tr><th>{}</th>", escape(row));
+        for &column in &columns {
+            let release = column.map(|index| run.releases[index]);
+            let (supported, missing) = support(run, by_combination, combinations, column);
+            let failing: Vec<(Cell, usize)> = combinations
+                .iter()
+                .filter_map(|&combination| {
+                    failed
+                        .get(&(combination, release))
+                        .map(|&cell| (cell, combination))
+                })
+                .collect();
+            let (cell, combination) = failing.iter().min().copied().unwrap_or_else(|| {
+                let cell = if supported == 0 {
+                    Cell::Unsupported
+                } else if missing == 0 {
+                    Cell::Compatible
+                } else {
+                    Cell::Partial
+                };
+                (cell, 0)
+            });
+            let mut title = format!(
+                "{row} × {}: {supported} {noun} supported",
+                release.map_or_else(|| "current".to_string(), |release| release.to_string())
+            );
+            if missing > 0 {
+                let _ = write!(
+                    title,
+                    ", {missing} more supported by {}",
+                    if column.is_some() {
+                        "current"
+                    } else {
+                        "a release"
+                    }
+                );
+            }
+            if !failing.is_empty() {
+                let _ = write!(title, ", {} failing", failing.len());
+            }
+            cell_html(out, cell, &title, combination);
+        }
+        out.push_str("</tr>\n");
+    }
+    out.push_str("</tbody></table></div>\n");
+}
+
+/// The number of `combinations` supported by a release (by index, or current if [`None`]), and the number missing that are supported by current (or by any release for current).
+///
+/// A release (or current) supports a combination if it reads back its own data for all cases.
+fn support(
+    run: &Run,
+    by_combination: &[Vec<&CaseResult>],
+    combinations: &[usize],
+    column: Option<usize>,
+) -> (usize, usize) {
+    let supports = |combination: usize, column: Option<usize>| {
+        by_combination[combination].iter().all(|result| {
+            let roundtrip = column.map_or(&result.current_roundtrip, |index| {
+                &result.releases[index].roundtrip
+            });
+            *roundtrip == Status::Ok
+        })
+    };
+    let supported = combinations
+        .iter()
+        .filter(|&&combination| supports(combination, column))
+        .count();
+    let missing = combinations
+        .iter()
+        .filter(|&&combination| {
+            !supports(combination, column)
+                && if column.is_some() {
+                    supports(combination, None)
+                } else {
+                    (0..run.releases.len()).any(|index| supports(combination, Some(index)))
+                }
+        })
+        .count();
+    (supported, missing)
+}
+
+/// A matrix cell, linking to the details of `combination` if it failed.
+fn cell_html(out: &mut String, cell: Cell, title: &str, combination: usize) {
+    let _ = write!(
+        out,
+        "<td class=\"{}\" title=\"{}\">",
+        cell.class(),
+        escape(title)
+    );
+    if let Some(prefix) = cell.anchor() {
+        let _ = write!(out, "<a href=\"#{prefix}{combination}\"></a>");
+    }
+    out.push_str("</td>");
 }
 
 /// A label of the oldest tested release that reads back its own data for any of `combinations` (if `all` releases are tested), or `new` if none do but current does.
+///
+/// Labels have a minimum width, so that labels before or after them are aligned.
 fn since(
     run: &Run,
     by_combination: &[Vec<&CaseResult>],
@@ -679,13 +916,15 @@ fn since(
         })
         .max();
     match oldest {
-        Some(oldest) if all => format!(" <span class=\"since\">{}</span>", run.releases[oldest]),
+        Some(oldest) if all => format!("<span class=\"since\">{}</span>", run.releases[oldest]),
         None if results
             .iter()
             .any(|result| result.current_roundtrip == Status::Ok) =>
         {
-            " <span class=\"since since-new\">new</span>".to_string()
+            "<span class=\"since since-new\">new</span>".to_string()
         }
+        // Keep labels aligned
+        _ if all => "<span class=\"since\"></span>".to_string(),
         _ => String::new(),
     }
 }
