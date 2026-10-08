@@ -44,7 +44,7 @@ pub(crate) enum Values {
 
 impl Values {
     /// The size of an innermost element in bytes, or [`None`] if variable length.
-    fn element_size(&self) -> Option<usize> {
+    pub(crate) fn element_size(&self) -> Option<usize> {
         match self {
             Self::Bool | Self::LowBits(_) | Self::Byte => Some(1),
             Self::UInt(bits) | Self::Int(bits) => Some((*bits as usize).div_ceil(8)),

@@ -5,14 +5,17 @@
 //!
 //! By default, only the latest release is tested and any regression results in a non-zero exit code.
 //! With `--all`, every release is tested and a summary of how far back compatibility extends is printed.
+//! With `--html <PATH>`, an HTML report with an overview of all combinations and the details of every failure is written.
 
 mod cases;
 mod data;
 mod helper;
 mod releases;
+mod report;
 mod run;
 mod summary;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -39,6 +42,9 @@ struct Args {
     /// Print every failure rather than one per combination.
     #[arg(long, short)]
     verbose: bool,
+    /// Write an HTML report with an overview of all combinations and the details of every failure.
+    #[arg(long, value_name = "PATH")]
+    html: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -142,11 +148,22 @@ fn run(args: &Args) -> Result<bool, String> {
     println!("{}", run.counts());
     if latest_failures.is_empty() {
         println!("✓ no regressions: current zarrs and zarrs {latest} read each other's data");
-        Ok(true)
     } else {
         println!("Regressions with the latest release ({latest}):");
         print!("{}", run.format_failures(&latest_failures, args.verbose));
         println!("\n✗ {} failing cases", latest_failures.len());
-        Ok(false)
     }
+
+    if let Some(path) = &args.html {
+        let meta = report::Meta {
+            seed,
+            samples: args.samples,
+            all: args.all,
+            filter: args.filter.as_deref(),
+        };
+        let html = report::html(&run, &failures, &known_issues, &meta);
+        std::fs::write(path, html).map_err(|err| format!("write {}: {err}", path.display()))?;
+        println!("report written to {}", path.display());
+    }
+    Ok(latest_failures.is_empty())
 }
